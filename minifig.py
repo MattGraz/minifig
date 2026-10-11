@@ -242,7 +242,8 @@ def compose_sheet(photo, picks, outdir):
     from PIL import Image, ImageDraw
     slots = ['hair', 'head', 'torso', 'legs']
     cell, pad = 240, 30
-    W = cell * 2 + pad * 3
+    n = len(slots) + 1                      # photo + 4 part panels
+    W = pad * (n + 1) + cell * n
     sheet = Image.new('RGB', (W, cell + 60), 'white')
     d = ImageDraw.Draw(sheet)
     d.text((pad, 10), 'Minifigure match', fill='black')
