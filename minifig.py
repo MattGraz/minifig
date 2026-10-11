@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""minifig.py — photo -> LEGO minifigure parts recommendation (Pick a Brick codes).
+"""minifig.py — photo -> LEGO minifigure parts recommendation (Pick a Brick links).
 
 Replicates brickify.fun's core workflow locally: analyze a photo of a person with a
-local vision LLM (oMLX), then recommend official LEGO minifigure parts (wig, head
-face print, torso, legs) with element IDs and Pick a Brick links.
+local vision LLM (oMLX), then recommend official LEGO minifigure parts — hair, head
+print, torso, legs, plus headwear and held accessories — with element IDs, purchase
+links, and an HTML report.
 
 Catalog: Rebrickable CSVs (https://rebrickable.com/downloads/) — run download_data.sh first.
 Env: reuse ~/.venvs/brickify (Pillow, httpx) per python-env consolidation rule.
 
 Usage:
-  ~/.venvs/brickify/bin/python minifig.py PHOTO [-o OUTDIR] [--no-images]
+  ~/.venvs/brickify/bin/python minifig.py PHOTO [-o OUTDIR] [--no-images] [--no-accessories]
 """
-import argparse, base64, csv, json, os, re, sys, time
-import urllib.request
+import argparse, base64, csv, html, json, os, re, sys, time
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE / 'data'
 OMLX_URL = 'http://127.0.0.1:8010/v1/chat/completions'
 MODEL = 'Qwen3.8-Flash-Next-heretic-2-oQ4e-mtp'
+CORE_SLOTS = ['hair', 'head', 'torso', 'legs']
+EXTRA_SLOTS = ['headwear', 'held']
 
 # ---------------------------------------------------------------- catalog ----
 def load_csv(name):
@@ -33,13 +36,9 @@ def build_catalog():
     parts = load_csv('parts.csv')
     names = {r['part_num']: r['name'] for r in parts}
     colors = {r['id']: {'name': r['name'], 'rgb': r.get('rgb', '')} for r in load_csv('colors.csv')}
-    # element_id by (part_num, color_id)
     elem = {}
     for r in load_csv('elements.csv'):
         elem[(r['part_num'], r['color_id'])] = r['element_id']
-
-    def ok(n, *bad):
-        return not any(b.lower() in n.lower() for b in bad)
 
     hair, head, torso, legs = [], [], [], []
     for r in parts:
@@ -54,9 +53,18 @@ def build_catalog():
             legs.append(pn)
         elif re.match(r'^Hips (and|with) .*Legs.*Print', nm) and not any(x in nm for x in ('Slope', 'Droid', 'Mechanical', 'Dress', 'Robe')):
             legs.append(pn)
-        elif 'Shorts' in nm and 'Print' in nm and 'Hips' in nm:
+        elif nm.startswith('Hips') and 'Shorts' in nm and 'Print' in nm and 'Minidoll' not in nm:
             legs.append(pn)
-    return {'hair': hair, 'head': head, 'torso': torso, 'legs': legs}, names, colors, elem
+
+    headwear, held = [], []
+    for r in parts:
+        pn, nm = r['part_num'], r['name']
+        if re.match(r'^(Cap[ ,]|Hat |Helmet |Beret|Crown |Bonnet)', nm) and 'Hair and' not in nm and 'Duplo' not in nm and 'Creature' not in nm and 'Minidoll' not in nm:
+            headwear.append(pn)
+        if (nm.startswith('Equipment') or nm.startswith('Sports') or nm.startswith('Minifig Accessory') or nm.startswith('Tool')) and 'Print' not in nm and 'Duplo' not in nm and 'Harry Potter' not in nm and 'Quidditch' not in nm and 'Trophy' not in nm:
+            held.append(pn)
+    return {'hair': hair, 'head': head, 'torso': torso, 'legs': legs,
+            'headwear': headwear, 'held': held}, names, colors, elem
 
 # ---------------------------------------------------------------- omlx api ---
 def _omlx_key():
@@ -101,11 +109,12 @@ DESCRIBE_PROMPT = """Look at this photo of a real person. Answer ONLY with a JSO
  "skin_tone": "one of: white, light tan, tan, brown, dark brown",
  "hair_color": "black/dark brown/medium brown/light brown/reddish brown/auburn/gray/white/blond/bald",
  "hair_style": "short/short curly/medium bob/long straight/long curly/ponytail/braided/pulled back messy/bald",
- "glasses": true or false, "facial_hair": "none/moustache/beard/beard and moustache/goatee/stubble",
+ "glasses": true, "facial_hair": "none/moustache/beard/beard and moustache/goatee/stubble",
  "top_description": "brief description of shirt/jacket incl colors, e.g. blue denim shirt with collar",
- "bottom_description": "brief description of pants incl color",
- "headwear": "none or description",
- "notable": "any other distinguishing feature"}"""
+ "bottom_description": "brief description of pants/shorts incl color",
+ "headwear": "none, or the exact headwear incl color",
+ "held_item": "none unless they are CLEARLY gripping an object in their hand; if they are wearing or displaying jewelry (a chain, a necklace), put that in notable and keep held_item none",
+ "notable": "any other distinguishing feature or accessory (chains, badges, etc)"}"""
 
 def describe_person(img_path):
     txt = omlx([{'role': 'user', 'content': [
@@ -123,7 +132,7 @@ COLOR_SYNONYMS = {
     'white': ['white'], 'blond': ['yellow', 'blond', 'light yellow'],
     'blue': ['blue'], 'denim': ['blue', 'denim'], 'red': ['red'],
     'green': ['green'], 'brown': ['brown', 'nougat', 'tan'],
-    'grayish': ['gray', 'grey'], 'orange': ['orange'],
+    'grayish': ['gray', 'grey'], 'orange': ['orange'], 'gold': ['gold', 'yellow'],
 }
 
 def tokens(text):
@@ -131,38 +140,46 @@ def tokens(text):
 
 def score_name(name, query_tokens, synonym_tokens):
     nt = tokens(name)
-    s = len(nt & query_tokens)
-    s += 2 * len(nt & synonym_tokens)
-    return s
+    return len(nt & query_tokens) + 2 * len(nt & synonym_tokens)
 
 def build_queries(desc):
-    """For each slot, (primary_text, alt_text) used to score catalog names."""
     q = {}
-    hair_q = f"{desc.get('hair_color','')} {desc.get('hair_style','')} hair"
     if desc.get('hair_color') == 'bald':
-        hair_q = 'bald hair'
-    q['hair'] = hair_q
+        q['hair'] = 'bald hair'
+    else:
+        q['hair'] = f"{desc.get('hair_color','')} {desc.get('hair_style','')} hair"
     face_bits = []
     if desc.get('age') == 'child':
         face_bits.append('boy' if desc.get('sex') != 'female' else 'girl')
-    if desc.get('glasses'): face_bits.append('glasses')
+    if desc.get('glasses'):
+        face_bits.append('glasses')
     fh = desc.get('facial_hair', 'none')
-    if fh and fh != 'none': face_bits.append(fh.replace(' and ', ' '))
-    if desc.get('age') == 'elderly': face_bits.append('old man')
+    if fh and fh != 'none':
+        face_bits.append(fh.replace(' and ', ' '))
+    if desc.get('age') == 'elderly':
+        face_bits.append('old man')
     face_bits.append('smile')
     q['head'] = 'Minifig Head ' + ' '.join(face_bits) + ' Print'
     q['torso'] = f"Torso {desc.get('top_description','')} Print"
-    if desc.get('bottom_description'):
-        bd = desc['bottom_description'].lower()
-        shorts_hint = 'Shorts' if 'short' in bd else 'Pants'
-        q['legs'] = f"Hips Legs {bd.split(',')[0]} {shorts_hint} Print"
+    bd = (desc.get('bottom_description') or '').lower()
+    if bd and bd != 'not visible':
+        hint = 'Shorts' if 'short' in bd else 'Pants'
+        q['legs'] = f"Hips Legs {bd.split(',')[0]} {hint} Print"
     else:
-        q['legs'] = "Hips Legs Pants Print"
+        q['legs'] = 'Hips Legs Blue Jeans Print'
+    hw = desc.get('headwear', 'none')
+    if hw and hw != 'none':
+        q['headwear'] = f"Cap Hat {hw}"
+    held = desc.get('held_item', 'none')
+    if held and held != 'none':
+        q['held'] = f"Equipment {held}"
     return q
 
 def retrieve(catalog, names, desc, topk=6):
     out = {}
     for slot, qtext in build_queries(desc).items():
+        if slot not in catalog:
+            continue
         qt = tokens(qtext)
         syn = set()
         for word in list(qt):
@@ -171,64 +188,65 @@ def retrieve(catalog, names, desc, topk=6):
         for pn in catalog[slot]:
             nm = names[pn]
             sc = score_name(nm, qt, syn)
-            # shorts on a real child = bare legs; skin-tone leg color is mandatory.
-            # Deprioritize costume-colored legs (magenta/green/etc) and
-            # boost "Hips and <Skin> ... Shorts" structures.
             if slot == 'legs' and 'short' in qtext.lower():
                 if re.search(r'(Nougat|Fair|Warm Tan|Tan) Legs', nm):
                     sc += 8
                 elif re.search(r'(Magenta|Bright Green|Dark Red|Purple|Orange|Neon) Legs', nm):
                     sc -= 6
                 if 'Knee' in nm:
-                    sc -= 2  # knee-pad prints are a costume, not plain shorts
+                    sc -= 2
             scored.append((sc, pn))
         scored.sort(key=lambda x: (-x[0], x[1]))
+        if slot in ('headwear', 'held'):
+            # accessory slots only fire on strong matches — no weak guesses
+            if scored and scored[0][0] >= 4:
+                out[slot] = [pn for _, pn in scored[:topk]]
+            continue
         out[slot] = [pn for _, pn in scored[:topk]]
     return out
 
 # --------------------------------------------------------- stage 3: choose ---
-def final_pick(img_path, desc, shortlist, names, colors, elem):
+def final_pick(img_path, desc, shortlist, names, elem):
     lines = []
     for slot, pns in shortlist.items():
         lines.append(f'\n{slot.upper()} candidates:')
         for pn in pns:
-            e = elem.get((pn, ''), elem.get(pn, ''))
-            # find any element for this printed part
             eid = ''
-            if slot in ('head', 'torso'):
-                for (p, c), v in elem.items():
-                    if p == pn:
-                        eid = v; break
-            colname = ''
             for (p, c), v in elem.items():
-                if p == pn and c in colors:
-                    colname = colors[c]['name']; break
+                if p == pn:
+                    eid = v
+                    break
             lines.append(f'  {pn}: {names[pn]} [element {eid}]')
+    slot_list = list(shortlist.keys())
+    answer_keys = ', '.join(f'"{s}": "<part_num or NONE>"' for s in slot_list)
     pick_prompt = (
         'You recommend official LEGO minifigure parts that best match the person in the photo.\n'
         f'Observed description: {json.dumps(desc)}\n'
-        'Pick EXACTLY ONE part per slot from the candidate lists. '
-        'Prefer the candidate whose printed design most resembles the person. '
-        'IMPORTANT accuracy rules: if the person is COMPLETELY bald (clean scalp), output "NONE" for hair — '
-        'do not pick a bald-top-with-hair-on-sides piece unless they truly have long hair on the sides; '
-        'if they have only light stubble, pick a stubble or clean-shaven head, NOT a full-beard head; '
-        'if they are a child, pick a child/neutral face, NOT an animal or alien print; '
-        'for LEGS with shorts, the legs must be a SKIN color (nougat/tan/white), never magenta/green/costume colors; '
-        'match garment colors as literally as possible. '
-        'Answer ONLY JSON: {"hair": "<part_num or NONE>", "head": "<part_num>", "torso": "<part_num>", "legs": "<part_num>", "reasoning": "<one line>"}'
+        'Pick EXACTLY ONE part per slot from the candidate lists, or "NONE" if none of the candidates is a good match.\n'
+        'IMPORTANT accuracy rules:\n'
+        '- If the person is COMPLETELY bald, output NONE for hair.\n'
+        '- If they have only light stubble, pick a stubble or clean-shaven head, NOT a full-beard head.\n'
+        '- If they are a child, pick a child/neutral face, NOT an animal or alien print.\n'
+        '- For LEGS with shorts, the legs must be a SKIN color (nougat/tan/white), never magenta/green/costume colors.\n'
+        '- Only pick HEADWEAR if they are actually wearing something on their head; otherwise NONE.\n'
+        '- Only pick a HELD item if the photo clearly shows them holding something purchasable; when in doubt NONE.\n'
+        '- Match garment colors as literally as possible.\n'
+        f'Answer ONLY JSON: {{{answer_keys}, "reasoning": "<one line>"}}'
         + '\n'.join(lines))
     txt = omlx([{'role': 'user', 'content': [
         {'type': 'image_url', 'image_url': {'url': image_data_url(img_path)}},
-        {'type': 'text', 'text': pick_prompt}]}], max_tokens=500)
+        {'type': 'text', 'text': pick_prompt}]}], max_tokens=600)
     m = re.search(r'\{.*\}', txt, re.S)
     return json.loads(m.group(0))
 
 # ------------------------------------------------------------ render sheet --
 def fetch_element_image(eid, outdir):
-    if not eid: return None
+    if not eid:
+        return None
     url = f'https://cdn.rebrickable.com/media/parts/elements/{eid}.jpg'
     dst = outdir / f'{eid}.jpg'
-    if dst.exists(): return dst
+    if dst.exists():
+        return dst
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=20) as r, open(dst, 'wb') as f:
@@ -238,11 +256,11 @@ def fetch_element_image(eid, outdir):
         print(f'  image fetch failed {eid}: {e}')
         return None
 
-def compose_sheet(photo, picks, outdir):
+def compose_sheet(photo, slots, picks, outdir):
     from PIL import Image, ImageDraw
-    slots = ['hair', 'head', 'torso', 'legs']
     cell, pad = 240, 30
-    n = len(slots) + 1                      # photo + 4 part panels
+    shown = [s for s in slots if picks.get('_images', {}).get(s)]
+    n = len(shown) + 1
     W = pad * (n + 1) + cell * n
     sheet = Image.new('RGB', (W, cell + 60), 'white')
     d = ImageDraw.Draw(sheet)
@@ -250,28 +268,77 @@ def compose_sheet(photo, picks, outdir):
     src = Image.open(photo).convert('RGB')
     src.thumbnail((cell, cell))
     sheet.paste(src, (pad, 40))
-    for i, slot in enumerate(slots):
-        p = picks.get('_images', {}).get(slot)
-        if p and Path(p).exists():
-            im = Image.open(p).convert('RGB')
-            im.thumbnail((cell, cell))
-            x = pad + (i + 1) * (cell + pad)
-            sheet.paste(im, (x, 40))
-            d.text((x + 4, cell + 46), slot, fill='black')
+    d.text((pad + 4, cell + 46), 'PHOTO', fill='black')
+    for i, slot in enumerate(shown):
+        im = Image.open(picks['_images'][slot]).convert('RGB')
+        im.thumbnail((cell, cell))
+        x = pad + (i + 1) * (cell + pad)
+        sheet.paste(im, (x, 40))
+        d.text((x + 4, cell + 46), slot.upper(), fill='black')
     sheet.save(outdir / 'sheet.png')
+
+def compose_html(photo, slots, result, outdir):
+    def esc(s):
+        return html.escape(str(s))
+    rows = []
+    for slot in slots:
+        r = result['picks'].get(slot)
+        if not r:
+            rows.append(f'<div class="card none"><h3>{esc(slot)}</h3><p>NONE</p></div>')
+            continue
+        img = ''
+        ip = outdir / f"{r['element_id']}.jpg"
+        if r['element_id'] and ip.exists():
+            b64 = base64.b64encode(ip.read_bytes()).decode()
+            img = f'<img src="data:image/jpeg;base64,{b64}" alt="{esc(r["name"])}">'
+        rows.append(f'''<div class="card">
+          <h3>{esc(slot)}</h3>
+          <div class="img">{img}</div>
+          <p class="name">{esc(r['name'])}</p>
+          <p class="meta">part <code>{esc(r['part_num'])}</code> · element <code>{esc(r['element_id'])}</code> · {esc(r['color'])}</p>
+          <p><a href="{esc(r['pick_a_brick'])}" target="_blank">Buy on LEGO.com Pick a Brick →</a></p>
+          <p><a href="https://rebrickable.com/parts/{esc(r['part_num'])}/" target="_blank">View on Rebrickable</a></p>
+        </div>''')
+    photo_b64 = base64.b64encode(Path(photo).read_bytes()).decode()
+    doc = f'''<!doctype html>
+<html><head><meta charset="utf-8"><title>Minifigure recommendation</title>
+<style>
+ body {{ font-family: -apple-system, sans-serif; background:#f5f5f5; margin:0; padding:24px; color:#222; }}
+ h1 {{ font-size:20px; }}
+ .strip {{ display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }}
+ .photo {{ background:#fff; border-radius:12px; padding:12px; box-shadow:0 1px 4px rgba(0,0,0,.15); }}
+ .photo img {{ max-width:360px; border-radius:8px; }}
+ .card {{ background:#fff; border-radius:12px; padding:16px; width:280px; box-shadow:0 1px 4px rgba(0,0,0,.15); }}
+ .card h3 {{ margin:0 0 8px; text-transform:capitalize; }}
+ .card .img img {{ width:100%; border-radius:8px; background:#fafafa; }}
+ .card .name {{ font-size:13px; font-weight:600; }}
+ .card .meta {{ font-size:12px; color:#666; }}
+ .none {{ opacity:.6; }}
+ .reason {{ margin-top:16px; padding:12px 16px; background:#fff; border-radius:12px; }}
+</style></head><body>
+<h1>Minifigure recommendation</h1>
+<div class="strip">
+  <div class="photo"><h3>photo</h3><img src="data:image/jpeg;base64,{photo_b64}"></div>
+  {''.join(rows)}
+</div>
+<div class="reason"><b>reasoning:</b> {esc(result.get('reasoning',''))}</div>
+</body></html>'''
+    (outdir / 'report.html').write_text(doc)
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('photo')
     ap.add_argument('-o', '--out', default=None)
     ap.add_argument('--no-images', action='store_true')
+    ap.add_argument('--no-accessories', action='store_true',
+                    help='skip headwear/held accessory slots')
     a = ap.parse_args()
     t0 = time.time()
     outdir = Path(a.out) if a.out else HERE / 'out' / Path(a.photo).stem
     outdir.mkdir(parents=True, exist_ok=True)
 
     catalog, names, colors, elem = build_catalog()
-    print(f'catalog: hair={len(catalog["hair"])} head={len(catalog["head"])} torso={len(catalog["torso"])} legs={len(catalog["legs"])}')
+    print('catalog: ' + ' '.join(f'{k}={len(v)}' for k, v in catalog.items()))
 
     print('analyzing photo (vision)...')
     desc = describe_person(a.photo)
@@ -279,74 +346,68 @@ def main():
 
     print('retrieving candidates...')
     shortlist = retrieve(catalog, names, desc)
-    # legs: if the photo doesn't show legs, default to classic blue — don't guess
+    if a.no_accessories:
+        for s in EXTRA_SLOTS:
+            shortlist.pop(s, None)
+    # legs: if the photo doesn't show legs, default to classic blue jeans
     if desc.get('bottom_description') in (None, 'not visible', ''):
         jeans = [pn for pn in catalog['legs'] if re.search(r'jeans|denim', names[pn], re.I)]
         plain = [pn for pn in catalog['legs'] if 'Blue' in names[pn]]
         shortlist['legs'] = (jeans + plain)[:4]
-    for s, pns in shortlist.items():
-        print(f'  {s}: ' + ' | '.join(f'{p} ({names[p][:50]})' for p in pns[:3]))
+    slots = CORE_SLOTS + [s for s in EXTRA_SLOTS if s in shortlist]
+    for s in slots:
+        print(f'  {s}: ' + ' | '.join(f'{p} ({names[p][:50]})' for p in shortlist[s][:3]))
 
     print('final pick (vision + candidates)...')
-    picks = final_pick(a.photo, desc, shortlist, names, colors, elem)
+    picks = final_pick(a.photo, desc, shortlist, names, elem)
 
-    # resolve element ids + Pick a Brick URLs (hair needs color selection by name)
-    result = {'description': desc, 'picks': {}, 'shortlist': shortlist}
+    result = {'description': desc, 'picks': {}, 'shortlist': {s: shortlist[s] for s in slots}}
     hair_color_match = None
     if desc.get('hair_color') and desc['hair_color'] != 'bald':
-        # find nearest LEGO color name for hair
         want = tokens(desc['hair_color'])
         best, bs = None, -1
         for cid, c in colors.items():
-            ct = tokens(c['name'])
-            s = len(want & ct)
-            if s > bs and c['name'] not in ('[Unknown]',):
+            s = len(want & tokens(c['name']))
+            if s > bs and c['name'] != '[Unknown]':
                 bs, best = s, cid
-        if bs <= 0: best = None
+        if bs <= 0:
+            best = None
         hair_color_match = best
     img_paths = {}
-    for slot in ('hair', 'head', 'torso', 'legs'):
+    for slot in slots:
         pn = picks.get(slot)
-        if not pn or pn == 'NONE': continue
+        if not pn or pn == 'NONE':
+            continue
         cid = ''
-        if slot == 'hair' and hair_color_match:
-            # does this part exist in that color?
-            for (p, c), v in elem.items():
-                if p == pn:
-                    if c == hair_color_match:
-                        cid = c; break
-                    if not cid: cid = c
-        else:
-            for (p, c), v in elem.items():
-                if p == pn: cid = c; break
+        want_c = hair_color_match if slot == 'hair' else None
+        for (p, c) in elem:
+            if p != pn:
+                continue
+            if want_c and c == want_c:
+                cid = c
+                break
+            if not cid:
+                cid = c
         eid = elem.get((pn, cid), '')
-        if not eid:
-            # design-only parts (e.g. 16709pat28) have no element row; use name search
+        if eid:
+            url = f'https://www.lego.com/en-us/pick-and-build/pick-a-brick?query={eid}'
+        else:
             url = 'https://www.lego.com/en-us/pick-and-build/pick-a-brick?query=' + \
                   urllib.parse.quote(names.get(pn, pn).split(' [')[0])
-        else:
-            url = f'https://www.lego.com/en-us/pick-and-build/pick-a-brick?query={eid}'
         result['picks'][slot] = {'part_num': pn, 'name': names.get(pn, '?'),
                                   'element_id': eid, 'color': colors.get(cid, {}).get('name', ''),
                                   'pick_a_brick': url}
         if not a.no_images and eid:
             ip = fetch_element_image(eid, outdir)
-            if ip: img_paths[slot] = str(ip)
+            if ip:
+                img_paths[slot] = str(ip)
     result['reasoning'] = picks.get('reasoning', '')
 
     (outdir / 'recommendation.json').write_text(json.dumps(result, indent=2))
-    md = [f'# Minifigure recommendation\n\n- photo: {a.photo}\n']
-    for slot in ('hair', 'head', 'torso', 'legs'):
-        r = result['picks'].get(slot)
-        if not r:
-            md.append(f'## {slot}\n- NONE (clean-shaven / no hair piece needed)\n')
-            continue
-        md.append(f'## {slot}\n- {r.get("name","?")}\n- part `{r.get("part_num")}` element `{r.get("element_id")}` color {r.get("color")}\n- {r.get("pick_a_brick")}\n')
-    md.append(f'\nreasoning: {result["reasoning"]}\n')
-    (outdir / 'recommendation.md').write_text('\n'.join(md))
     result['picks']['_images'] = img_paths
-    compose_sheet(a.photo, result['picks'], outdir)
-    print(f'\ndone in {time.time()-t0:.0f}s -> {outdir}/recommendation.md')
+    compose_sheet(a.photo, slots, result, outdir)
+    compose_html(a.photo, slots, {'picks': result['picks'], 'reasoning': result['reasoning']}, outdir)
+    print(f'\ndone in {time.time()-t0:.0f}s -> {outdir}/report.html')
 
 if __name__ == '__main__':
     main()
