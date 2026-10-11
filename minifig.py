@@ -355,9 +355,11 @@ def target_hue(slot, desc, pixel):
 
 SKIN_IDS = {'Nougat': None}
 
-def pick_element(pn, by_part, colors, want_fam):
+def pick_element(pn, by_part, colors, want_fam, cache_dir=None):
     """Choose the element variant whose plastic color matches the target hue.
-    Falls back to the first variant if nothing matches (soft)."""
+    When cache_dir is given, prefer a variant whose product image actually
+    exists on the CDN (proves the element exists and lets us show a real
+    picture + working link). Falls back to the first variant if nothing matches."""
     plist = by_part.get(pn, [])
     if not plist:
         return '', ''
@@ -366,15 +368,19 @@ def pick_element(pn, by_part, colors, want_fam):
             nm = colors.get(cid, {}).get('name', '').lower()
             if nm == want_fam or (want_fam == 'nougat' and nm in ('light nougat', 'medium nougat')):
                 return cid, eid
-        # skin prints also ship on 'Yellow'/'Fair' — accept any nougat-ish skin tone
         for cid, eid in plist:
             nm = colors.get(cid, {}).get('name', '').lower()
             if 'nougat' in nm or nm in ('tan', 'fair', 'yellow'):
                 return cid, eid
     elif want_fam:
-        for cid, eid in plist:
-            if hue_family(colors.get(cid, {}).get('name', '')) == want_fam:
-                return cid, eid
+        cands = [(cid, eid) for cid, eid in plist
+                 if hue_family(colors.get(cid, {}).get('name', '')) == want_fam]
+        if cands:
+            if cache_dir is not None:
+                for cid, eid in cands:
+                    if fetch_element_image(eid, cache_dir):
+                        return cid, eid
+            return cands[0]
     return plist[0]
 
 def retrieve(catalog, names, desc, pixel, by_part=None, colors=None, topk=10):
@@ -629,7 +635,7 @@ def main():
         cands = shortlist[s]
         scored = []
         for pn in cands:
-            cid, eid = pick_element(pn, by_part, colors, want)
+            cid, eid = pick_element(pn, by_part, colors, want, cache_dir=HERE / 'out' / '_cache')
             if not eid:
                 continue  # no element in the required plastic color — skip design
             ip = fetch_element_image(eid, HERE / 'out' / '_cache')
@@ -656,7 +662,7 @@ def main():
         for cov, d, pn in scored:
             deltas[pn] = d
         for pn in final_cands[s]:
-            cid, eid = pick_element(pn, by_part, colors, want)
+            cid, eid = pick_element(pn, by_part, colors, want, cache_dir=HERE / 'out' / '_cache')
             print(f'  {s}: {eid} {names[pn][:55]} [{colors.get(cid,{}).get("name","?")}]')
 
     print('stage 5: image-grounded verification (LLM)...')
@@ -676,7 +682,7 @@ def main():
         if not pn:
             continue
         want = target_hue(slot, desc, pixel) if slot != 'head' else None
-        cid, eid = pick_element(pn, by_part, colors, want)
+        cid, eid = pick_element(pn, by_part, colors, want, cache_dir=HERE / 'out' / '_cache')
         url = (f'https://www.lego.com/en-us/pick-and-build/pick-a-brick?query={eid}' if eid
                else 'https://www.lego.com/en-us/pick-and-build/pick-a-brick?query='
                     + urllib.parse.quote(names.get(pn, pn).split(' [')[0]))
