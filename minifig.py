@@ -46,13 +46,15 @@ def build_catalog():
         pn, nm = r['part_num'], r['name']
         if nm.startswith('Hair') and 'Pattern' not in nm and 'Hair and' not in nm and 'Head' not in nm:
             hair.append(pn)
-        elif re.match(r'^Minifig Head \d', nm) or re.match(r'^Minifig Head, ', nm) or (nm.startswith('Minifig Head ') and 'Print' in nm and not any(x in nm for x in ('Alien', 'Droid', 'Robot', 'Fish', 'Wolf', 'Ogre', 'Dinosaur', 'Shark', 'Skeleton', 'Zombie', 'Vampire', 'Gorilla', 'Panda', 'Palpatine', 'Garazeb', 'Shrek', 'Zeb'))):
+        elif nm.startswith('Minifig Head') and 'Print' in nm and not any(x in nm for x in ('Special', 'Alien', 'Droid', 'Robot', 'Fish', 'Wolf', 'Ogre', 'Dinosaur', 'Shark', 'Skeleton', 'Zombie', 'Vampire', 'Gorilla', 'Panda', 'Palpatine', 'Garazeb', 'Shrek', 'Zeb', 'Tongue')) and not re.match(r'^Minifig Head \d', nm):
             head.append(pn)
         elif nm.startswith('Torso') and 'Print' in nm and not any(x in nm for x in ('Mechanical', 'Wings', 'Droid', 'Robot', 'Bionicle', 'Exo-Force', 'Baby', 'Minidoll')) and 'Dress' not in nm[:30]:
             torso.append(pn)
         elif nm.startswith('Legs') and 'Pattern' in nm and not any(x in nm for x in ('Mechanical', 'Martian', 'Enderman', 'Skeleton')):
             legs.append(pn)
         elif re.match(r'^Hips (and|with) .*Legs.*Print', nm) and not any(x in nm for x in ('Slope', 'Droid', 'Mechanical', 'Dress', 'Robe')):
+            legs.append(pn)
+        elif 'Shorts' in nm and 'Print' in nm and 'Hips' in nm:
             legs.append(pn)
     return {'hair': hair, 'head': head, 'torso': torso, 'legs': legs}, names, colors, elem
 
@@ -141,6 +143,8 @@ def build_queries(desc):
         hair_q = 'bald hair'
     q['hair'] = hair_q
     face_bits = []
+    if desc.get('age') == 'child':
+        face_bits.append('boy' if desc.get('sex') != 'female' else 'girl')
     if desc.get('glasses'): face_bits.append('glasses')
     fh = desc.get('facial_hair', 'none')
     if fh and fh != 'none': face_bits.append(fh.replace(' and ', ' '))
@@ -148,7 +152,12 @@ def build_queries(desc):
     face_bits.append('smile')
     q['head'] = 'Minifig Head ' + ' '.join(face_bits) + ' Print'
     q['torso'] = f"Torso {desc.get('top_description','')} Print"
-    q['legs'] = f"Hips Legs {desc.get('bottom_description','')} Pants Print"
+    if desc.get('bottom_description'):
+        bd = desc['bottom_description'].lower()
+        shorts_hint = 'Shorts' if 'short' in bd else 'Pants'
+        q['legs'] = f"Hips Legs {bd.split(',')[0]} {shorts_hint} Print"
+    else:
+        q['legs'] = "Hips Legs Pants Print"
     return q
 
 def retrieve(catalog, names, desc, topk=6):
@@ -162,6 +171,16 @@ def retrieve(catalog, names, desc, topk=6):
         for pn in catalog[slot]:
             nm = names[pn]
             sc = score_name(nm, qt, syn)
+            # shorts on a real child = bare legs; skin-tone leg color is mandatory.
+            # Deprioritize costume-colored legs (magenta/green/etc) and
+            # boost "Hips and <Skin> ... Shorts" structures.
+            if slot == 'legs' and 'short' in qtext.lower():
+                if re.search(r'(Nougat|Fair|Warm Tan|Tan) Legs', nm):
+                    sc += 8
+                elif re.search(r'(Magenta|Bright Green|Dark Red|Purple|Orange|Neon) Legs', nm):
+                    sc -= 6
+                if 'Knee' in nm:
+                    sc -= 2  # knee-pad prints are a costume, not plain shorts
             scored.append((sc, pn))
         scored.sort(key=lambda x: (-x[0], x[1]))
         out[slot] = [pn for _, pn in scored[:topk]]
@@ -193,6 +212,8 @@ def final_pick(img_path, desc, shortlist, names, colors, elem):
         'IMPORTANT accuracy rules: if the person is COMPLETELY bald (clean scalp), output "NONE" for hair — '
         'do not pick a bald-top-with-hair-on-sides piece unless they truly have long hair on the sides; '
         'if they have only light stubble, pick a stubble or clean-shaven head, NOT a full-beard head; '
+        'if they are a child, pick a child/neutral face, NOT an animal or alien print; '
+        'for LEGS with shorts, the legs must be a SKIN color (nougat/tan/white), never magenta/green/costume colors; '
         'match garment colors as literally as possible. '
         'Answer ONLY JSON: {"hair": "<part_num or NONE>", "head": "<part_num>", "torso": "<part_num>", "legs": "<part_num>", "reasoning": "<one line>"}'
         + '\n'.join(lines))
