@@ -1,0 +1,9 @@
+[project]
+name = "minifig"
+version = "0.1.0"
+description = "photo -> LEGO minifigure parts recommendation (Pick a Brick element IDs), fully local via oMLX vision"
+requires-python = ">=3.12"
+dependencies = ["pillow", "httpx"]
+
+[tool.uv]
+package = false
