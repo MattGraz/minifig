@@ -52,6 +52,8 @@ def build_catalog():
             torso.append(pn)
         elif nm.startswith('Legs') and 'Pattern' in nm and not any(x in nm for x in ('Mechanical', 'Martian', 'Enderman', 'Skeleton')):
             legs.append(pn)
+        elif re.match(r'^Hips (and|with) .*Legs.*Print', nm) and not any(x in nm for x in ('Slope', 'Droid', 'Mechanical', 'Dress', 'Robe')):
+            legs.append(pn)
     return {'hair': hair, 'head': head, 'torso': torso, 'legs': legs}, names, colors, elem
 
 # ---------------------------------------------------------------- omlx api ---
@@ -146,7 +148,7 @@ def build_queries(desc):
     face_bits.append('smile')
     q['head'] = 'Minifig Head ' + ' '.join(face_bits) + ' Print'
     q['torso'] = f"Torso {desc.get('top_description','')} Print"
-    q['legs'] = f"Legs {desc.get('bottom_description','')} Pants Pattern"
+    q['legs'] = f"Hips Legs {desc.get('bottom_description','')} Pants Print"
     return q
 
 def retrieve(catalog, names, desc, topk=6):
@@ -188,9 +190,11 @@ def final_pick(img_path, desc, shortlist, names, colors, elem):
         f'Observed description: {json.dumps(desc)}\n'
         'Pick EXACTLY ONE part per slot from the candidate lists. '
         'Prefer the candidate whose printed design most resembles the person. '
-        'For HAIR, the color must match their hair color (pick a different candidate if needed — '
-        'you may name any part_num starting with Hair even outside the list if color matters more). '
-        'Answer ONLY JSON: {"hair": "<part_num>", "head": "<part_num>", "torso": "<part_num>", "legs": "<part_num>", "reasoning": "<one line>"}'
+        'IMPORTANT accuracy rules: if the person is COMPLETELY bald (clean scalp), output "NONE" for hair — '
+        'do not pick a bald-top-with-hair-on-sides piece unless they truly have long hair on the sides; '
+        'if they have only light stubble, pick a stubble or clean-shaven head, NOT a full-beard head; '
+        'match garment colors as literally as possible. '
+        'Answer ONLY JSON: {"hair": "<part_num or NONE>", "head": "<part_num>", "torso": "<part_num>", "legs": "<part_num>", "reasoning": "<one line>"}'
         + '\n'.join(lines))
     txt = omlx([{'role': 'user', 'content': [
         {'type': 'image_url', 'image_url': {'url': image_data_url(img_path)}},
@@ -255,9 +259,9 @@ def main():
     shortlist = retrieve(catalog, names, desc)
     # legs: if the photo doesn't show legs, default to classic blue — don't guess
     if desc.get('bottom_description') in (None, 'not visible', ''):
-        plain = [pn for pn in catalog['legs'] if 'Blue' in names[pn] or 'blue' in names[pn].lower()]
-        if plain:
-            shortlist['legs'] = plain[:4]
+        jeans = [pn for pn in catalog['legs'] if re.search(r'jeans|denim', names[pn], re.I)]
+        plain = [pn for pn in catalog['legs'] if 'Blue' in names[pn]]
+        shortlist['legs'] = (jeans + plain)[:4]
     for s, pns in shortlist.items():
         print(f'  {s}: ' + ' | '.join(f'{p} ({names[p][:50]})' for p in pns[:3]))
 
@@ -281,7 +285,7 @@ def main():
     img_paths = {}
     for slot in ('hair', 'head', 'torso', 'legs'):
         pn = picks.get(slot)
-        if not pn: continue
+        if not pn or pn == 'NONE': continue
         cid = ''
         if slot == 'hair' and hair_color_match:
             # does this part exist in that color?
@@ -311,8 +315,11 @@ def main():
     (outdir / 'recommendation.json').write_text(json.dumps(result, indent=2))
     md = [f'# Minifigure recommendation\n\n- photo: {a.photo}\n']
     for slot in ('hair', 'head', 'torso', 'legs'):
-        r = result['picks'].get(slot, {})
-        md.append(f'## {slot}\n- {r.get("name","?")}\n- part `{slot and r.get("part_num")}` element `{r.get("element_id")}` color {r.get("color")}\n- {r.get("pick_a_brick")}\n')
+        r = result['picks'].get(slot)
+        if not r:
+            md.append(f'## {slot}\n- NONE (clean-shaven / no hair piece needed)\n')
+            continue
+        md.append(f'## {slot}\n- {r.get("name","?")}\n- part `{r.get("part_num")}` element `{r.get("element_id")}` color {r.get("color")}\n- {r.get("pick_a_brick")}\n')
     md.append(f'\nreasoning: {result["reasoning"]}\n')
     (outdir / 'recommendation.md').write_text('\n'.join(md))
     result['picks']['_images'] = img_paths
